@@ -1,8 +1,7 @@
 use super::{
-    BtcRelayPallet, DotBalancesPallet, PolkaBtcProvider, PolkaBtcRuntime, SecurityPallet,
-    StatusCode, VaultRegistryPallet,
+    BtcAddress, BtcPublicKey, BtcRelayPallet, DotBalancesPallet, PolkaBtcProvider, PolkaBtcRuntime,
+    SecurityPallet, StatusCode, VaultRegistryPallet,
 };
-use crate::BtcAddress;
 use module_bitcoin::{
     formatter::Formattable,
     types::{BlockBuilder, RawBlockHeader},
@@ -15,6 +14,13 @@ use substrate_subxt_client::{
 };
 use tempdir::TempDir;
 
+fn dummy_public_key() -> BtcPublicKey {
+    BtcPublicKey([
+        2, 205, 114, 218, 156, 16, 235, 172, 106, 37, 18, 153, 202, 140, 176, 91, 207, 51, 187, 55,
+        18, 45, 222, 180, 119, 54, 243, 97, 173, 150, 161, 169, 230,
+    ])
+}
+
 async fn test_client_with(key: AccountKeyring) -> PolkaBtcProvider {
     let tmp = TempDir::new("btc-parachain-").expect("failed to create tempdir");
     let config = SubxtClientConfig {
@@ -22,9 +28,8 @@ async fn test_client_with(key: AccountKeyring) -> PolkaBtcProvider {
         impl_version: "0.0.1",
         author: "Interlay Ltd",
         copyright_start_year: 2020,
-        db: DatabaseConfig::RocksDb {
-            path: tmp.path().join("db"),
-            cache_size: 128,
+        db: DatabaseConfig::ParityDb {
+            path: tmp.path().join("db")
         },
         keystore: KeystoreConfig::Path {
             path: tmp.path().join("keystore"),
@@ -65,14 +70,15 @@ async fn test_parachain_status() {
 #[tokio::test]
 async fn test_register_vault() {
     let provider = test_client_with(AccountKeyring::Alice).await;
-
-    let address = BtcAddress::P2PKH(H160::random());
-    provider.register_vault(100, address).await.unwrap();
+    provider
+        .register_vault(100, dummy_public_key())
+        .await
+        .unwrap();
     let vault = provider
         .get_vault(AccountKeyring::Alice.to_account_id())
         .await
         .unwrap();
-    assert_eq!(vault.wallet.get_btc_address(), address);
+    assert_eq!(vault.wallet.public_key, dummy_public_key());
 }
 
 #[tokio::test]

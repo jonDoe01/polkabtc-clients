@@ -1,5 +1,5 @@
 use super::Error;
-use bitcoin::{BitcoinCore, BitcoinCoreApi};
+use bitcoin::BitcoinCoreApi;
 use futures::executor::block_on;
 use hex::FromHex;
 use jsonrpc_http_server::{
@@ -9,7 +9,7 @@ use jsonrpc_http_server::{
 use log::info;
 use parity_scale_codec::{Decode, Encode};
 use runtime::{
-    BtcAddress, ExchangeRateOraclePallet, FeePallet, FixedPointNumber,
+    BtcPublicKey, ExchangeRateOraclePallet, FeePallet, FixedPointNumber,
     FixedPointTraits::{CheckedAdd, CheckedMul},
     PolkaBtcProvider, ReplacePallet, UtilFuncs, VaultRegistryPallet,
 };
@@ -77,9 +77,15 @@ async fn _request_replace(api: &Arc<PolkaBtcProvider>, params: Params) -> Result
 
 /// Take the `percentage` of an `amount`
 fn calculate_for(amount: u128, percentage: FixedU128) -> Result<u128, Error> {
+    // we add 0.5 before we do the final integer division to round the result we return.
+    // note that unwrapping is safe because we use a constant
+    let rounding_addition = FixedU128::checked_from_rational(1, 2).unwrap();
+
     FixedU128::checked_from_integer(amount)
         .ok_or(Error::ArithmeticOverflow)?
         .checked_mul(&percentage)
+        .ok_or(Error::ArithmeticOverflow)?
+        .checked_add(&rounding_addition)
         .ok_or(Error::ArithmeticOverflow)?
         .into_inner()
         .checked_div(FixedU128::accuracy())
@@ -93,22 +99,22 @@ struct RegisterVaultJsonRpcRequest {
 
 #[derive(Encode, Decode, Debug)]
 struct RegisterVaultJsonRpcResponse {
-    address: BtcAddress,
+    public_key: BtcPublicKey,
 }
 
-fn _register_vault(
+fn _register_vault<B: BitcoinCoreApi>(
     api: &Arc<PolkaBtcProvider>,
-    btc: &Arc<BitcoinCore>,
+    btc: &Arc<B>,
     params: Params,
 ) -> Result<RegisterVaultJsonRpcResponse, Error> {
     let req = parse_params::<RegisterVaultJsonRpcRequest>(params)?;
-    let address = btc.get_new_address()?;
-    let result = block_on(api.register_vault(req.collateral, address));
+    let public_key: BtcPublicKey = block_on(btc.get_new_public_key())?;
+    let result = block_on(api.register_vault(req.collateral, public_key.clone()));
     info!(
-        "Registering vault with bitcoind address {} and collateral = {}: {:?}",
-        address, req.collateral, result
+        "Registering vault with bitcoind public_key {:?} and collateral = {}: {:?}",
+        public_key, req.collateral, result
     );
-    Ok(result.map(|_| RegisterVaultJsonRpcResponse { address })?)
+    Ok(result.map(|_| RegisterVaultJsonRpcResponse { public_key })?)
 }
 
 #[derive(Encode, Decode, Debug)]
@@ -137,21 +143,6 @@ fn _withdraw_collateral(api: &Arc<PolkaBtcProvider>, params: Params) -> Result<(
 }
 
 #[derive(Encode, Decode, Debug)]
-struct UpdateBtcAddressJsonRpcResponse {
-    address: BtcAddress,
-}
-
-fn _update_btc_address(
-    api: &Arc<PolkaBtcProvider>,
-    btc: &Arc<BitcoinCore>,
-) -> Result<UpdateBtcAddressJsonRpcResponse, Error> {
-    let address = btc.get_new_address()?;
-    let result = block_on(api.update_btc_address(address));
-    info!("Updating btc address to {}: {:?}", address, result);
-    Ok(result.map(|_| UpdateBtcAddressJsonRpcResponse { address })?)
-}
-
-#[derive(Encode, Decode, Debug)]
 struct WithdrawReplaceJsonRpcRequest {
     replace_id: H256,
 }
@@ -166,9 +157,9 @@ fn _withdraw_replace(api: &Arc<PolkaBtcProvider>, params: Params) -> Result<(), 
     Ok(result?)
 }
 
-pub async fn start(
+pub async fn start<B: BitcoinCoreApi + Send + Sync + 'static>(
     api: Arc<PolkaBtcProvider>,
-    btc: Arc<BitcoinCore>,
+    btc: Arc<B>,
     addr: SocketAddr,
     origin: String,
 ) {
@@ -201,13 +192,6 @@ pub async fn start(
         let api = api.clone();
         io.add_sync_method("withdraw_collateral", move |params| {
             handle_resp(_withdraw_collateral(&api, params))
-        });
-    }
-    {
-        let api = api.clone();
-        let btc = btc.clone();
-        io.add_sync_method("update_btc_address", move |_| {
-            handle_resp(_update_btc_address(&api, &btc))
         });
     }
     {

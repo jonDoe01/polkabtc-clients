@@ -7,16 +7,16 @@ mod rpc;
 mod tests;
 
 pub use btc_relay::{
-    BitcoinBlockHeight, BlockBuilder, BtcAddress, Formattable, H256Le, RawBlockHeader,
-    RichBlockHeader,
+    BitcoinBlockHeight, BlockBuilder, BtcAddress, BtcPublicKey, Formattable, H256Le,
+    RawBlockHeader, RichBlockHeader,
 };
 pub use error::{Error, XtError};
 use pallets::*;
 pub use rpc::{
     historic_event_types, AccountId, BtcRelayPallet, BtcTxFeesPerByte, DotBalancesPallet,
     ExchangeRateOraclePallet, FeePallet, IssuePallet, PolkaBtcHeader, PolkaBtcIssueRequest,
-    PolkaBtcProvider, PolkaBtcRedeemRequest, PolkaBtcReplaceRequest,
-    PolkaBtcRequestIssueEvent, PolkaBtcStatusUpdate, PolkaBtcVault, RedeemPallet,
+    PolkaBtcProvider, PolkaBtcRedeemRequest, PolkaBtcRefundRequest, PolkaBtcReplaceRequest,
+    PolkaBtcRequestIssueEvent, PolkaBtcStatusUpdate, PolkaBtcVault, RedeemPallet, RefundPallet,
     ReplacePallet, SecurityPallet, StakedRelayerPallet, TimestampPallet, UtilFuncs,
     VaultRegistryPallet,
 };
@@ -70,6 +70,7 @@ impl pallets::Core for PolkaBtcRuntime {
     type H160 = H160;
     type H256 = H256;
     type BtcAddress = BtcAddress;
+    type BtcPublicKey = BtcPublicKey;
     type ErrorCode = ErrorCode;
     type ErrorCodes = BTreeSet<ErrorCode>;
     type StatusCode = StatusCode;
@@ -109,6 +110,10 @@ impl redeem::Redeem for PolkaBtcRuntime {}
 
 impl replace::Replace for PolkaBtcRuntime {}
 
+impl refund::Refund for PolkaBtcRuntime {}
+
 impl sudo::Sudo for PolkaBtcRuntime {}
 
 impl fee::Fee for PolkaBtcRuntime {}
+
+impl treasury::Treasury for PolkaBtcRuntime {}

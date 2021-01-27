@@ -1,15 +1,18 @@
 use crate::constants::*;
 use crate::error::Error;
-use crate::issue::{process_issue_requests, IssueIds};
+use crate::issue::{process_issue_requests, IssueRequests};
 use backoff::{future::FutureOperation as _, ExponentialBackoff};
 use bitcoin::{BitcoinCoreApi, Transaction, TransactionExt, TransactionMetadata};
+use futures::stream::StreamExt;
 use log::*;
 use runtime::{
     pallets::{
-        redeem::RequestRedeemEvent, replace::AcceptReplaceEvent,
+        redeem::RequestRedeemEvent,
+        refund::RequestRefundEvent,
+        replace::{AcceptReplaceEvent, AuctionReplaceEvent},
     },
-    BtcAddress, H256Le, PolkaBtcProvider, PolkaBtcRedeemRequest,
-    PolkaBtcReplaceRequest, PolkaBtcRuntime, RedeemPallet, ReplacePallet, UtilFuncs,
+    BtcAddress, H256Le, PolkaBtcProvider, PolkaBtcRedeemRequest, PolkaBtcRefundRequest,
+    PolkaBtcReplaceRequest, PolkaBtcRuntime, RedeemPallet, RefundPallet, ReplacePallet, UtilFuncs,
     VaultRegistryPallet,
 };
 use sp_core::H256;
@@ -28,6 +31,7 @@ pub struct Request {
 pub enum RequestType {
     Redeem,
     Replace,
+    Refund,
 }
 
 impl Request {
@@ -42,22 +46,49 @@ impl Request {
         }
     }
     /// Constructs a Request for the given PolkaBtcReplaceRequest
-    fn from_replace_request(hash: H256, request: PolkaBtcReplaceRequest) -> Request {
-        Request {
+    fn from_replace_request(hash: H256, request: PolkaBtcReplaceRequest) -> Option<Request> {
+        Some(Request {
             hash,
             open_time: Some(request.open_time),
             amount: request.amount,
-            btc_address: request.btc_address,
+            btc_address: request.btc_address?,
             request_type: RequestType::Replace,
+        })
+    }
+    /// Constructs a Request for the given PolkaBtcRefundRequest
+    fn from_refund_request(hash: H256, request: PolkaBtcRefundRequest) -> Request {
+        Request {
+            hash,
+            open_time: None,
+            amount: request.amount_btc,
+            btc_address: request.btc_address,
+            request_type: RequestType::Refund,
+        }
+    }
+    /// Constructs a Request for the given RequestRefundEvent
+    pub fn from_refund_request_event(request: &RequestRefundEvent<PolkaBtcRuntime>) -> Request {
+        Request {
+            btc_address: request.btc_address,
+            amount: request.amount_polka_btc,
+            hash: request.refund_id,
+            open_time: None,
+            request_type: RequestType::Refund,
         }
     }
     /// Constructs a Request for the given AcceptReplaceEvent
-    pub fn from_replace_request_event(
-        request: &AcceptReplaceEvent<PolkaBtcRuntime>,
-        btc_address: BtcAddress,
-    ) -> Request {
+    pub fn from_accept_replace_event(request: &AcceptReplaceEvent<PolkaBtcRuntime>) -> Request {
         Request {
-            btc_address,
+            btc_address: request.btc_address,
+            amount: request.btc_amount,
+            hash: request.replace_id,
+            open_time: None,
+            request_type: RequestType::Replace,
+        }
+    }
+    /// Constructs a Request for the given AuctionReplaceEvent
+    pub fn from_auction_replace_event(request: &AuctionReplaceEvent<PolkaBtcRuntime>) -> Request {
+        Request {
+            btc_address: request.btc_address,
             amount: request.btc_amount,
             hash: request.replace_id,
             open_time: None,
@@ -78,7 +109,7 @@ impl Request {
     /// Makes the bitcoin transfer and executes the request
     pub async fn pay_and_execute<
         B: BitcoinCoreApi,
-        P: ReplacePallet + RedeemPallet + VaultRegistryPallet + UtilFuncs + Send + Sync,
+        P: ReplacePallet + RefundPallet + RedeemPallet + VaultRegistryPallet + UtilFuncs + Send + Sync,
     >(
         &self,
         provider: Arc<P>,
@@ -101,16 +132,12 @@ impl Request {
         info!("Sending bitcoin to {}", self.btc_address);
 
         let tx = btc_rpc
-            .create_transaction(
-                self.btc_address,
-                self.amount as u64,
-                &self.hash.to_fixed_bytes(),
-            )
+            .create_transaction(self.btc_address, self.amount as u64, Some(self.hash))
             .await?;
 
         let return_to_self_addresses = tx
             .transaction
-            .extract_output_addresses()?
+            .extract_output_addresses()
             .into_iter()
             .filter(|x| x != &self.btc_address)
             .collect::<Vec<_>>();
@@ -124,13 +151,13 @@ impl Request {
                 let wallet = provider.get_vault(vault_id).await?.wallet;
                 if !wallet.has_btc_address(&address) {
                     info!("Registering address {}", address);
-                    provider.update_btc_address(address.clone()).await?;
+                    provider.register_address(address.clone()).await?;
                 }
             }
             _ => return Err(Error::TooManyReturnToSelfAddresses),
         };
 
-        let txid = btc_rpc.send_transaction(tx)?;
+        let txid = btc_rpc.send_transaction(tx).await?;
         let tx_metadata = btc_rpc
             .wait_for_transaction_metadata(txid, BITCOIN_MAX_RETRYING_TIME, num_confirmations)
             .await?;
@@ -140,7 +167,7 @@ impl Request {
     }
 
     /// Executes the request. Upon failure it will retry
-    async fn execute<P: ReplacePallet + RedeemPallet>(
+    async fn execute<P: ReplacePallet + RedeemPallet + RefundPallet>(
         &self,
         provider: Arc<P>,
         tx_metadata: TransactionMetadata,
@@ -149,6 +176,7 @@ impl Request {
         let execute = match self.request_type {
             RequestType::Redeem => RedeemPallet::execute_redeem,
             RequestType::Replace => ReplacePallet::execute_replace,
+            RequestType::Refund => RefundPallet::execute_refund,
         };
 
         // Retry until success or timeout
@@ -196,15 +224,22 @@ pub async fn execute_open_requests<B: BitcoinCoreApi + Send + Sync + 'static>(
         .filter(|(_, request)| !request.completed && !request.cancelled)
         .map(|(hash, request)| Request::from_redeem_request(hash, request));
     let open_replaces = provider
-        .get_old_vault_replace_requests(vault_id)
+        .get_old_vault_replace_requests(vault_id.clone())
         .await?
         .into_iter()
         .filter(|(_, request)| !request.completed && !request.cancelled)
-        .map(|(hash, request)| Request::from_replace_request(hash, request));
+        .filter_map(|(hash, request)| Request::from_replace_request(hash, request));
+    let open_refunds = provider
+        .get_vault_refund_requests(vault_id)
+        .await?
+        .into_iter()
+        .filter(|(_, request)| !request.completed)
+        .map(|(hash, request)| Request::from_refund_request(hash, request));
 
-    // Place all redeems&replaces into a hashmap, indexed by their redeemid/replaceid
+    // Place all redeems,replaces&refunds into a hashmap, indexed by their redeemid/replaceid
     let mut hash_map = open_redeems
         .chain(open_replaces)
+        .chain(open_refunds)
         .map(|x| (x.hash, x))
         .collect::<HashMap<_, _>>();
 
@@ -219,7 +254,9 @@ pub async fn execute_open_requests<B: BitcoinCoreApi + Send + Sync + 'static>(
     };
 
     // iterate through transactions..
-    for x in bitcoin::get_transactions(btc_rpc.clone(), btc_start_height)? {
+    let mut transaction_stream =
+        bitcoin::get_transactions(btc_rpc.clone(), btc_start_height).await?;
+    while let Some(x) = transaction_stream.next().await {
         let tx = x?;
 
         // get the request this transaction corresponds to, if any
@@ -301,7 +338,7 @@ pub async fn execute_open_requests<B: BitcoinCoreApi + Send + Sync + 'static>(
 pub async fn execute_open_issue_requests<B: BitcoinCoreApi + Send + Sync + 'static>(
     provider: Arc<PolkaBtcProvider>,
     btc_rpc: Arc<B>,
-    issue_set: Arc<IssueIds>,
+    issue_set: Arc<IssueRequests>,
     num_confirmations: u32,
 ) -> Result<(), Error> {
     (|| async {
@@ -340,7 +377,6 @@ mod tests {
     //     use runtime::{AccountId, Error as RuntimeError, PolkaBtcVault};
     //     use sp_core::H160;
     //     use std::future::Future;
-    //
     //     macro_rules! assert_ok {
     //         ( $x:expr $(,)? ) => {
     //             let is = $x;
@@ -353,7 +389,6 @@ mod tests {
     //             assert_eq!($x, Ok($y));
     //         };
     //     }
-    //
     //     macro_rules! assert_err {
     //         ($result:expr, $err:pat) => {{
     //             match $result {
@@ -363,17 +398,16 @@ mod tests {
     //             }
     //         }};
     //     }
-    //
+
     //     mockall::mock! {
     //         Provider {}
-    //
+
     //         #[async_trait]
     //         pub trait UtilFuncs {
     //             async fn get_current_chain_height(&self) -> Result<u32, RuntimeError>;
     //             async fn get_blockchain_height_at(&self, parachain_height: u32) -> Result<u32, RuntimeError>;
     //             fn get_account_id(&self) -> &AccountId;
     //         }
-    //
     //         #[async_trait]
     //         pub trait VaultRegistryPallet {
     //             async fn get_vault(&self, vault_id: AccountId) -> Result<PolkaBtcVault, RuntimeError>;
@@ -386,7 +420,6 @@ mod tests {
     //             async fn get_required_collateral_for_vault(&self, vault_id: AccountId) -> Result<u128, RuntimeError>;
     //             async fn is_vault_below_auction_threshold(&self, vault_id: AccountId) -> Result<bool, RuntimeError>;
     //         }
-    //
     //         #[async_trait]
     //         pub trait RedeemPallet {
     //             async fn get_redeem_request(&self, redeem_id: H256) -> Result<PolkaBtcRedeemRequest, RuntimeError>;
@@ -443,27 +476,23 @@ mod tests {
     //             async fn get_replace_request(&self, replace_id: H256) -> Result<PolkaBtcReplaceRequest, RuntimeError>;
     //         }
     //     }
-    //
+
     //     mockall::mock! {
     //         Bitcoin {}
-    //
+
     //         #[async_trait]
     //         trait BitcoinCoreApi {
     //             async fn wait_for_block(&self, height: u32, delay: Duration) -> Result<BlockHash, BitcoinError>;
-    //             fn get_block_count(&self) -> Result<u64, BitcoinError>;
-    //             fn get_block_transactions(
-    //                 &self,
-    //                 hash: &BlockHash,
-    //             ) -> Result<Vec<Option<GetRawTransactionResult>>, BitcoinError>;
-    //             fn get_raw_tx_for(&self, txid: &Txid, block_hash: &BlockHash) -> Result<Vec<u8>, BitcoinError>;
-    //             fn get_proof_for(&self, txid: Txid, block_hash: &BlockHash) -> Result<Vec<u8>, BitcoinError>;
-    //             fn get_block_hash_for(&self, height: u32) -> Result<BlockHash, BitcoinError>;
-    //             fn is_block_known(&self, block_hash: BlockHash) -> Result<bool, BitcoinError>;
-    //             fn get_new_address<A: PartialAddress + Send + 'static>(&self) -> Result<A, BitcoinError>;
-    //             fn get_best_block_hash(&self) -> Result<BlockHash, BitcoinError>;
-    //             fn get_block(&self, hash: &BlockHash) -> Result<Block, BitcoinError>;
-    //             fn get_block_info(&self, hash: &BlockHash) -> Result<GetBlockResult, BitcoinError>;
-    //             fn get_mempool_transactions<'a>(
+    //             async fn get_block_count(&self) -> Result<u64, BitcoinError>;
+    //             async fn get_raw_tx_for(&self, txid: &Txid, block_hash: &BlockHash) -> Result<Vec<u8>, BitcoinError>;
+    //             async fn get_proof_for(&self, txid: Txid, block_hash: &BlockHash) -> Result<Vec<u8>, BitcoinError>;
+    //            async  fn get_block_hash_for(&self, height: u32) -> Result<BlockHash, BitcoinError>;
+    //             async fn is_block_known(&self, block_hash: BlockHash) -> Result<bool, BitcoinError>;
+    //             async fn get_new_address<A: PartialAddress + Send + 'static>(&self) -> Result<A, BitcoinError>;
+    //             async fn get_best_block_hash(&self) -> Result<BlockHash, BitcoinError>;
+    //             async fn get_block(&self, hash: &BlockHash) -> Result<Block, BitcoinError>;
+    //             async fn get_block_info(&self, hash: &BlockHash) -> Result<GetBlockResult, BitcoinError>;
+    //             async fn get_mempool_transactions<'a>(
     //                 self: Arc<Self>,
     //             ) -> Result<Box<dyn Iterator<Item = Result<Transaction, BitcoinError>> + 'a>, BitcoinError>;
     //             async fn wait_for_transaction_metadata(
@@ -476,27 +505,27 @@ mod tests {
     //                 &self,
     //                 address: A,
     //                 sat: u64,
-    //                 request_id: &[u8; 32],
+    //                 request_id: Option<H256>,
     //             ) -> Result<LockedTransaction, BitcoinError>;
-    //             fn send_transaction(&self, transaction: LockedTransaction) -> Result<Txid, BitcoinError>;
+    //             async fn send_transaction(&self, transaction: LockedTransaction) -> Result<Txid, BitcoinError>;
     //             async fn create_and_send_transaction<A: PartialAddress + Send + 'static>(
     //                 &self,
     //                 address: A,
     //                 sat: u64,
-    //                 request_id: &[u8; 32],
+    //                 request_id: Option<H256>,
     //             ) -> Result<Txid, BitcoinError>;
     //             async fn send_to_address<A: PartialAddress + Send + 'static>(
     //                 &self,
     //                 address: A,
     //                 sat: u64,
-    //                 request_id: &[u8; 32],
+    //                 request_id: Option<H256>,
     //                 op_timeout: Duration,
     //                 num_confirmations: u32,
     //             ) -> Result<TransactionMetadata, BitcoinError>;
-    //             fn create_wallet(&self, wallet: &str) -> Result<(), BitcoinError>;
+    //             async fn create_wallet(&self, wallet: &str) -> Result<(), BitcoinError>;
     //         }
     //     }
-    //
+
     //     fn dummy_transaction_metadata() -> TransactionMetadata {
     //         TransactionMetadata {
     //             block_hash: Default::default(),

@@ -14,13 +14,12 @@ use log::*;
 use parity_scale_codec::{Decode, Encode};
 use runtime::{
     substrate_subxt::PairSigner, BtcAddress, ErrorCode as PolkaBtcErrorCode,
-    ExchangeRateOraclePallet, FeePallet, FixedPointNumber, H256Le, PolkaBtcProvider,
-    PolkaBtcRuntime, RedeemPallet, StatusCode as PolkaBtcStatusCode, TimestampPallet,
-    VaultRegistryPallet,
+    ExchangeRateOraclePallet, FeePallet, FixedPointNumber, FixedPointTraits::*, FixedU128, H256Le,
+    PolkaBtcProvider, PolkaBtcRuntime, RedeemPallet, StakedRelayerPallet,
+    StatusCode as PolkaBtcStatusCode, TimestampPallet,
 };
 use sp_core::H256;
 use sp_keyring::AccountKeyring;
-use std::array::TryFromSliceError;
 use std::convert::TryInto;
 use std::str::FromStr;
 use std::time::Duration;
@@ -33,6 +32,7 @@ impl std::str::FromStr for BtcAddressFromStr {
         Ok(BtcAddressFromStr(PartialAddress::decode_str(btc_address)?))
     }
 }
+
 #[derive(Debug, Encode, Decode)]
 struct PolkaBtcStatusCodeFromStr(PolkaBtcStatusCode);
 impl std::str::FromStr for PolkaBtcStatusCodeFromStr {
@@ -132,6 +132,8 @@ enum SubCommand {
     SetRedeemPeriod(SetRedeemPeriodInfo),
     /// Set replace period.
     SetReplacePeriod(SetReplacePeriodInfo),
+    /// Set relayer maturity period.
+    SetRelayerMaturityPeriod(SetRelayerMaturityPeriodInfo),
 }
 
 #[derive(Clap)]
@@ -237,6 +239,7 @@ struct ChainStatOpts {
     #[clap(long)]
     end: Option<u32>,
 }
+
 #[derive(Clap)]
 struct SetExchangeRateInfo {
     /// Exchange rate from BTC to DOT.
@@ -258,15 +261,16 @@ struct SetBtcTxFeesInfo {
     #[clap(long, default_value = "300")]
     hour: u32,
 }
+
 #[derive(Clap)]
 struct RegisterVaultInfo {
-    /// Bitcoin address for vault to receive funds.
-    #[clap(long)]
-    btc_address: BtcAddressFromStr,
-
     /// Collateral to secure position.
     #[clap(long, default_value = "100000")]
     collateral: u128,
+
+    /// Bitcoin network type for address encoding.
+    #[clap(long, default_value = "regtest")]
+    bitcoin_network: BitcoinNetwork,
 }
 
 #[derive(Clap)]
@@ -286,21 +290,25 @@ struct RequestIssueInfo {
     /// Bitcoin network type for address encoding.
     #[clap(long, default_value = "regtest")]
     bitcoin_network: BitcoinNetwork,
+
+    /// Do not transfer BTC or execute the issue request.
+    #[clap(long)]
+    no_execute: bool,
 }
 
 #[derive(Clap)]
 struct SendBitcoinInfo {
     /// Recipient Bitcoin address.
     #[clap(long)]
-    btc_address: BtcAddressFromStr,
+    btc_address: Option<BtcAddressFromStr>,
 
     /// Amount of BTC to transfer.
     #[clap(long, default_value = "0")]
-    satoshis: u64,
+    satoshis: u128,
 
-    /// Hex encoded OP_RETURN data for request.
+    /// Issue id for the issue request.
     #[clap(long)]
-    op_return: String,
+    issue_id: Option<H256>,
 
     /// Bitcoin network type for address encoding.
     #[clap(long, default_value = "regtest")]
@@ -327,6 +335,12 @@ struct SetReplacePeriodInfo {
     #[clap(long)]
     period: u32,
 }
+#[derive(Clap)]
+struct SetRelayerMaturityPeriodInfo {
+    /// Duration of the relayer bonding period.
+    #[clap(long)]
+    period: u32,
+}
 
 #[derive(Clap)]
 struct RequestRedeemInfo {
@@ -347,7 +361,7 @@ struct RequestRedeemInfo {
 struct ExecuteRedeemInfo {
     /// Redeem id for the redeem request.
     #[clap(long)]
-    redeem_id: String,
+    redeem_id: H256,
 
     /// Bitcoin network type for address encoding.
     #[clap(long, default_value = "regtest")]
@@ -369,18 +383,22 @@ struct RequestReplaceInfo {
 struct AcceptReplaceInfo {
     /// Replace id for the replace request.
     #[clap(long)]
-    replace_id: String,
+    replace_id: H256,
 
     /// Collateral used to back replace.
     #[clap(long, default_value = "10000")]
     collateral: u128,
+
+    /// Bitcoin network type for address encoding.
+    #[clap(long, default_value = "regtest")]
+    bitcoin_network: BitcoinNetwork,
 }
 
 #[derive(Clap)]
 struct ExecuteReplaceInfo {
     /// Replace id for the replace request.
     #[clap(long)]
-    replace_id: String,
+    replace_id: H256,
 
     /// Bitcoin network type for address encoding.
     #[clap(long, default_value = "regtest")]
@@ -482,17 +500,13 @@ struct VoteOnStatusUpdateJsonRpcRequest {
     pub approve: bool,
 }
 
-fn data_to_request_id(data: &[u8]) -> Result<[u8; 32], TryFromSliceError> {
-    data.try_into()
-}
-
-fn get_btc_rpc(
+async fn get_btc_rpc(
     wallet_name: String,
     bitcoin_opts: bitcoin::cli::BitcoinOpts,
     network: BitcoinNetwork,
 ) -> Result<BitcoinCore, Error> {
     let btc_rpc = BitcoinCore::new(bitcoin_opts.new_client(Some(&wallet_name))?, network.0);
-    btc_rpc.create_wallet(&wallet_name)?;
+    btc_rpc.create_wallet(&wallet_name).await?;
     Ok(btc_rpc)
 }
 
@@ -508,7 +522,8 @@ async fn main() -> Result<(), Error> {
 
     match opts.subcmd {
         SubCommand::SetExchangeRate(info) => {
-            provider.set_exchange_rate_info(info.exchange_rate).await?;
+            let rate = FixedU128::checked_from_rational(info.exchange_rate, 100_000).unwrap();
+            provider.set_exchange_rate_info(rate).await?;
         }
         SubCommand::GetExchangeRate => {
             let (rate, time, delay) = provider.get_exchange_rate_info().await?;
@@ -533,13 +548,16 @@ async fn main() -> Result<(), Error> {
             println!("{}", provider.get_time_now().await?);
         }
         SubCommand::RegisterVault(info) => {
-            vault::register_vault(provider, info.btc_address.0, info.collateral).await?;
+            let btc_rpc = get_btc_rpc(wallet_name, opts.bitcoin, info.bitcoin_network).await?;
+            vault::register_vault(
+                provider,
+                btc_rpc.get_new_public_key().await?,
+                info.collateral,
+            )
+            .await?;
         }
         SubCommand::RequestIssue(info) => {
             let vault_id = info.vault.to_account_id();
-            let vault = provider.get_vault(vault_id.clone()).await?;
-
-            let vault_btc_address = vault.wallet.get_btc_address();
 
             let griefing_collateral = match info.griefing_collateral {
                 Some(x) => x,
@@ -548,9 +566,20 @@ async fn main() -> Result<(), Error> {
                     let amount_in_dot = provider.btc_to_dots(info.issue_amount).await?;
                     let required_griefing_collateral_rate =
                         provider.get_issue_griefing_collateral().await?;
-                    let griefing_collateral = required_griefing_collateral_rate
-                        .checked_mul_int(amount_in_dot)
-                        .ok_or(Error::MathError)?;
+
+                    // we add 0.5 before we do the final integer division to round the result we return.
+                    // note that unwrapping is safe because we use a constant
+                    let calc_griefing_collateral = || {
+                        let rounding_addition = FixedU128::checked_from_rational(1, 2).unwrap();
+
+                        FixedU128::checked_from_integer(amount_in_dot)?
+                            .checked_mul(&required_griefing_collateral_rate)?
+                            .checked_add(&rounding_addition)?
+                            .into_inner()
+                            .checked_div(FixedU128::accuracy())
+                    };
+
+                    let griefing_collateral = calc_griefing_collateral().ok_or(Error::MathError)?;
                     info!(
                         "Griefing collateral not set; defaulting to {}",
                         griefing_collateral
@@ -563,7 +592,14 @@ async fn main() -> Result<(), Error> {
                 issue::request_issue(&provider, info.issue_amount, griefing_collateral, vault_id)
                     .await?;
 
-            let btc_rpc = get_btc_rpc(wallet_name, opts.bitcoin, info.bitcoin_network)?;
+            let vault_btc_address = request_data.btc_address;
+
+            if info.no_execute {
+                println!("{}", hex::encode(request_data.issue_id.as_bytes()));
+                return Ok(());
+            }
+
+            let btc_rpc = get_btc_rpc(wallet_name, opts.bitcoin, info.bitcoin_network).await?;
             issue::execute_issue(
                 &provider,
                 &btc_rpc,
@@ -574,17 +610,36 @@ async fn main() -> Result<(), Error> {
             .await?;
         }
         SubCommand::SendBitcoin(info) => {
-            let data = &hex::decode(info.op_return)?;
-            let btc_rpc = get_btc_rpc(wallet_name, opts.bitcoin, info.bitcoin_network)?;
+            let (btc_address, satoshis) = if let Some(issue_id) = info.issue_id {
+                // gets the data from on-chain
+                let issue_request = issue::get_issue_by_id(&provider, issue_id).await?;
+                if issue_request.completed {
+                    return Err(Error::IssueCompleted);
+                } else if issue_request.cancelled {
+                    return Err(Error::IssueCancelled);
+                }
+
+                (
+                    issue_request.btc_address,
+                    issue_request.amount + issue_request.fee,
+                )
+            } else {
+                // expects cli configuration
+                let btc_address = info.btc_address.ok_or(Error::ExpectedBitcoinAddress)?.0;
+                (btc_address, info.satoshis)
+            };
+
+            let btc_rpc = get_btc_rpc(wallet_name, opts.bitcoin, info.bitcoin_network).await?;
             let tx_metadata = btc_rpc
                 .send_to_address(
-                    info.btc_address.0,
-                    info.satoshis,
-                    &data_to_request_id(data)?,
+                    btc_address,
+                    satoshis.try_into().unwrap(),
+                    None,
                     Duration::from_secs(15 * 60),
                     1,
                 )
                 .await?;
+
             println!("{}", tx_metadata.txid);
         }
         SubCommand::RequestRedeem(info) => {
@@ -598,10 +653,10 @@ async fn main() -> Result<(), Error> {
             println!("{}", hex::encode(redeem_id.as_bytes()));
         }
         SubCommand::ExecuteRedeem(info) => {
-            let redeem_id = H256::from_str(&info.redeem_id).map_err(|_| Error::InvalidRequestId)?;
+            let redeem_id = info.redeem_id;
             let redeem_request = provider.get_redeem_request(redeem_id).await?;
 
-            let btc_rpc = get_btc_rpc(wallet_name, opts.bitcoin, info.bitcoin_network)?;
+            let btc_rpc = get_btc_rpc(wallet_name, opts.bitcoin, info.bitcoin_network).await?;
             redeem::execute_redeem(
                 &provider,
                 &btc_rpc,
@@ -618,15 +673,12 @@ async fn main() -> Result<(), Error> {
             println!("{}", hex::encode(replace_id.as_bytes()));
         }
         SubCommand::AcceptReplace(info) => {
-            let replace_id =
-                H256::from_str(&info.replace_id).map_err(|_| Error::InvalidRequestId)?;
-            replace::accept_replace(&provider, replace_id, info.collateral).await?;
+            let btc_rpc = get_btc_rpc(wallet_name, opts.bitcoin, info.bitcoin_network).await?;
+            replace::accept_replace(&provider, &btc_rpc, info.replace_id, info.collateral).await?;
         }
         SubCommand::ExecuteReplace(info) => {
-            let replace_id =
-                H256::from_str(&info.replace_id).map_err(|_| Error::InvalidRequestId)?;
-            let btc_rpc = get_btc_rpc(wallet_name, opts.bitcoin, info.bitcoin_network)?;
-            replace::execute_replace(&provider, &btc_rpc, replace_id).await?;
+            let btc_rpc = get_btc_rpc(wallet_name, opts.bitcoin, info.bitcoin_network).await?;
+            replace::execute_replace(&provider, &btc_rpc, info.replace_id).await?;
         }
         SubCommand::GetChainStats(opts) => {
             stats::report_chain_stats(&provider, opts.start, opts.end).await?;
@@ -689,6 +741,9 @@ async fn main() -> Result<(), Error> {
         }
         SubCommand::SetReplacePeriod(info) => {
             replace::set_replace_period(&provider, info.period).await?;
+        }
+        SubCommand::SetRelayerMaturityPeriod(info) => {
+            provider.set_maturity_period(info.period).await?;
         }
     }
 

@@ -37,6 +37,7 @@ impl<B: BitcoinCoreApi, P: StakedRelayerPallet> StatusUpdateMonitor<B, P> {
             match self
                 .btc_rpc
                 .is_block_known(convert_block_hash(event.block_hash)?)
+                .await
             {
                 Ok(true) => {
                     self.polka_rpc
@@ -123,7 +124,7 @@ impl<B: BitcoinCoreApi, P: StakedRelayerPallet> RelayMonitor<B, P> {
         info!("Block submission: {}", parachain_block_hash);
 
         // TODO: check if user submitted
-        match self.btc_rpc.get_block_hash_for(height) {
+        match self.btc_rpc.get_block_hash_for(height).await {
             Ok(bitcoin_block_hash) => {
                 if bitcoin_block_hash.into_inner() != parachain_block_hash.to_bytes_le() {
                     warn!("Block does not match at height {}", height);
@@ -151,8 +152,8 @@ impl<B: BitcoinCoreApi, P: StakedRelayerPallet> RelayMonitor<B, P> {
     }
 }
 
-pub async fn listen_for_blocks_stored(
-    btc_rpc: Arc<BitcoinCore>,
+pub async fn listen_for_blocks_stored<B: BitcoinCoreApi>(
+    btc_rpc: Arc<B>,
     polka_rpc: Arc<PolkaBtcProvider>,
     status_update_deposit: u128,
 ) -> Result<(), RuntimeError> {
@@ -185,13 +186,14 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use bitcoin::{
-        Block, GetBlockResult, GetRawTransactionResult, LockedTransaction, PartialAddress,
-        Transaction, TransactionMetadata, Txid,
+        Block, GetBlockResult, LockedTransaction, PartialAddress, Transaction, TransactionMetadata,
+        Txid, PUBLIC_KEY_SIZE,
     };
     use runtime::PolkaBtcStatusUpdate;
     use runtime::{AccountId, Error as RuntimeError, ErrorCode, H256Le, StatusCode, MINIMUM_STAKE};
+    use sp_core::H256;
     use sp_keyring::AccountKeyring;
-    use std::{future::Future, time::Duration};
+    use std::time::Duration;
 
     macro_rules! assert_ok {
         ( $x:expr $(,)? ) => {
@@ -260,6 +262,7 @@ mod tests {
                 vault_id: AccountId,
                 raw_tx: Vec<u8>,
             ) -> Result<bool, RuntimeError>;
+            async fn set_maturity_period(&self, period: u32) -> Result<(), RuntimeError>;
         }
     }
 
@@ -268,68 +271,56 @@ mod tests {
 
         #[async_trait]
         trait BitcoinCoreApi {
-            async fn wait_for_block(&self, height: u32, delay: Duration) -> Result<BlockHash, BitcoinError>;
-
-            fn get_block_count(&self) -> Result<u64, BitcoinError>;
-
-            fn get_block_transactions(
+            async fn wait_for_block(&self, height: u32, delay: Duration, num_confirmations: u32) -> Result<BlockHash, BitcoinError>;
+            async fn get_block_count(&self) -> Result<u64, BitcoinError>;
+            async fn get_raw_tx_for(&self, txid: &Txid, block_hash: &BlockHash) -> Result<Vec<u8>, BitcoinError>;
+            async fn get_proof_for(&self, txid: Txid, block_hash: &BlockHash) -> Result<Vec<u8>, BitcoinError>;
+           async  fn get_block_hash_for(&self, height: u32) -> Result<BlockHash, BitcoinError>;
+            async fn is_block_known(&self, block_hash: BlockHash) -> Result<bool, BitcoinError>;
+            async fn get_new_address<A: PartialAddress + Send + 'static>(&self) -> Result<A, BitcoinError>;
+            async fn get_new_public_key<P: From<[u8; PUBLIC_KEY_SIZE]> + 'static>(&self) -> Result<P, BitcoinError>;
+            async fn add_new_deposit_key<P: Into<[u8; PUBLIC_KEY_SIZE]> + Send + Sync + 'static>(
                 &self,
-                hash: &BlockHash,
-            ) -> Result<Vec<Option<GetRawTransactionResult>>, BitcoinError>;
-
-            fn get_raw_tx_for(&self, txid: &Txid, block_hash: &BlockHash) -> Result<Vec<u8>, BitcoinError>;
-
-            fn get_proof_for(&self, txid: Txid, block_hash: &BlockHash) -> Result<Vec<u8>, BitcoinError>;
-
-            fn get_block_hash_for(&self, height: u32) -> Result<BlockHash, BitcoinError>;
-
-            fn is_block_known(&self, block_hash: BlockHash) -> Result<bool, BitcoinError>;
-
-            fn get_new_address<A: PartialAddress + Send + 'static>(&self) -> Result<A, BitcoinError>;
-
-            fn get_best_block_hash(&self) -> Result<BlockHash, BitcoinError>;
-
-            fn get_block(&self, hash: &BlockHash) -> Result<Block, BitcoinError>;
-
-            fn get_block_info(&self, hash: &BlockHash) -> Result<GetBlockResult, BitcoinError>;
-
-            fn get_mempool_transactions<'a>(
+                public_key: P,
+                secret_key: Vec<u8>,
+            ) -> Result<(), BitcoinError>;
+            async fn get_best_block_hash(&self) -> Result<BlockHash, BitcoinError>;
+            async fn get_block(&self, hash: &BlockHash) -> Result<Block, BitcoinError>;
+            async fn get_block_info(&self, hash: &BlockHash) -> Result<GetBlockResult, BitcoinError>;
+            async fn get_mempool_transactions<'a>(
                 self: Arc<Self>,
-            ) -> Result<Box<dyn Iterator<Item = Result<Transaction, BitcoinError>> + 'a>, BitcoinError>;
-
+            ) -> Result<Box<dyn Iterator<Item = Result<Transaction, BitcoinError>> + Send + 'a>, BitcoinError>;
             async fn wait_for_transaction_metadata(
                 &self,
                 txid: Txid,
                 op_timeout: Duration,
                 num_confirmations: u32,
             ) -> Result<TransactionMetadata, BitcoinError>;
-
             async fn create_transaction<A: PartialAddress + Send + 'static>(
                 &self,
                 address: A,
                 sat: u64,
-                request_id: &[u8; 32],
+                request_id: Option<H256>,
             ) -> Result<LockedTransaction, BitcoinError>;
-
-            fn send_transaction(&self, transaction: LockedTransaction) -> Result<Txid, BitcoinError>;
-
+            async fn send_transaction(&self, transaction: LockedTransaction) -> Result<Txid, BitcoinError>;
             async fn create_and_send_transaction<A: PartialAddress + Send + 'static>(
                 &self,
                 address: A,
                 sat: u64,
-                request_id: &[u8; 32],
+                request_id: Option<H256>,
             ) -> Result<Txid, BitcoinError>;
-
             async fn send_to_address<A: PartialAddress + Send + 'static>(
                 &self,
                 address: A,
                 sat: u64,
-                request_id: &[u8; 32],
+                request_id: Option<H256>,
                 op_timeout: Duration,
                 num_confirmations: u32,
             ) -> Result<TransactionMetadata, BitcoinError>;
-
-            fn create_wallet(&self, wallet: &str) -> Result<(), BitcoinError>;
+            async fn create_wallet(&self, wallet: &str) -> Result<(), BitcoinError>;
+            async fn wallet_has_public_key<P>(&self, public_key: P) -> Result<bool, BitcoinError>
+                where
+                    P: Into<[u8; PUBLIC_KEY_SIZE]> + From<[u8; PUBLIC_KEY_SIZE]> + Clone + PartialEq + Send + Sync + 'static;
         }
     }
 

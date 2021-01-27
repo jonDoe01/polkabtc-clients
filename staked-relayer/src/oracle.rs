@@ -72,9 +72,9 @@ mod tests {
 
         #[async_trait]
         trait ExchangeRateOraclePallet {
-            async fn get_exchange_rate_info(&self) -> Result<(u64, u64, u64), Error>;
+            async fn get_exchange_rate_info(&self) -> Result<(FixedU128, u64, u64), Error>;
 
-            async fn set_exchange_rate_info(&self, btc_to_dot_rate: u128) -> Result<(), Error>;
+            async fn set_exchange_rate_info(&self, dot_per_btc: FixedU128) -> Result<(), Error>;
 
             async fn set_btc_tx_fees_per_byte(&self, fast: u32, half: u32, hour: u32) -> Result<(), Error>;
 
@@ -118,6 +118,7 @@ mod tests {
                 vault_id: AccountId,
                 raw_tx: Vec<u8>,
             ) -> Result<bool, Error>;
+            async fn set_maturity_period(&self, period: u32) -> Result<(), Error>;
         }
 
         #[async_trait]
@@ -132,7 +133,7 @@ mod tests {
         let mut parachain = MockProvider::default();
         parachain
             .expect_get_exchange_rate_info()
-            .returning(|| Ok((0, 0, 0)));
+            .returning(|| Ok((FixedU128::one(), 0, 0)));
         parachain.expect_get_time_now().returning(|| Ok(1));
 
         assert_eq!(
@@ -149,7 +150,7 @@ mod tests {
         let mut parachain = MockProvider::default();
         parachain
             .expect_get_exchange_rate_info()
-            .returning(|| Ok((0, 1, 3)));
+            .returning(|| Ok((FixedU128::one(), 1, 3)));
         parachain.expect_get_time_now().returning(|| Ok(2));
 
         assert_eq!(
@@ -172,7 +173,7 @@ mod tests {
         // is_offline should return true
         parachain
             .expect_get_exchange_rate_info()
-            .returning(|| Ok((0, 0, 0)));
+            .returning(|| Ok((FixedU128::one(), 0, 0)));
         parachain.expect_get_time_now().returning(|| Ok(1));
 
         // should report if error not known
@@ -202,7 +203,7 @@ mod tests {
         // is_offline should return true
         parachain
             .expect_get_exchange_rate_info()
-            .returning(|| Ok((0, 0, 0)));
+            .returning(|| Ok((FixedU128::one(), 0, 0)));
         parachain.expect_get_time_now().returning(|| Ok(1));
 
         // should not report if error already known

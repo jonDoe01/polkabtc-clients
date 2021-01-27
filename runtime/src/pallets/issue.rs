@@ -24,6 +24,7 @@ pub struct RequestIssueEvent<T: Issue> {
     pub amount: T::PolkaBTC,
     pub vault_id: T::AccountId,
     pub btc_address: T::BtcAddress,
+    pub public_key: T::BtcPublicKey,
 }
 
 #[derive(Clone, Debug, PartialEq, Call, Encode)]
@@ -52,6 +53,13 @@ pub struct CancelIssueCall<T: Issue> {
 pub struct CancelIssueEvent<T: Issue> {
     pub issue_id: T::H256,
     pub requester: T::AccountId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Store, Encode)]
+pub struct IssueRequestsStore<T: Issue> {
+    #[store(returns = IssueRequest<T::AccountId, T::BlockNumber, T::PolkaBTC, T::DOT>)]
+    pub _runtime: PhantomData<T>,
+    pub issue_id: T::H256,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Store, Encode)]
